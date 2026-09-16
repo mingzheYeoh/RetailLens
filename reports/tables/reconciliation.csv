@@ -1,0 +1,7 @@
+check,status,expected,actual,note
+fct_order is one row per order,PASS,unique,unique,Guards against items/payments fanning out the order grain.
+fct_order_item preserves every item line,PASS,112650,112650,An inner join to orders must not drop or duplicate item lines.
+product revenue ties to raw item prices,PASS,13591643.7,13591643.7,Order-grain revenue must equal the raw SUM(price).
+order value ties to item grain,PASS,15843553.24,15843553.24,The two fact tables must agree on total value.
+payments equal order value,KNOWN GAP,15843553.24,16008872.12,"Payments run 1.04% above item value: installment interest and voucher top-ups are charged to the customer but are not item revenue. Sales KPIs therefore use item value, not payment value."
+every order has a payment row,KNOWN GAP,0,1,"1 delivered order has no payment record upstream. Left as NULL rather than imputed to zero, so payment-side measures exclude it instead of understating it."

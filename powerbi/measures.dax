@@ -1,0 +1,278 @@
+// RetailLens - DAX measure library
+//
+// Paste into Tabular Editor (Advanced Scripting off, just create measures) or
+// recreate in Power BI Desktop. Every measure here has a matching SQL definition
+// in sql/03_marts.sql and a written definition in powerbi/KPI_DEFINITIONS.md.
+//
+// Model shape (star, single-direction filters from dims to facts):
+//
+//     Dim_Date ---------+
+//     Dim_Customer -----+--> Fct_Order  (order grain)
+//     Dim_Product ------+--> Fct_OrderItem (item grain)
+//     Dim_Seller -------+
+//
+// Two fact tables at two grains share the same dimensions. The rule that keeps
+// the report honest: money that belongs to an order is measured on Fct_Order,
+// money that belongs to a product is measured on Fct_OrderItem, and the two are
+// never summed together.
+
+
+// ---------------------------------------------------------------- base filters
+// Cancelled and unavailable orders never became revenue. Every sales measure
+// routes through this instead of repeating the filter, so changing the
+// definition changes every KPI at once.
+Sales Orders Base =
+CALCULATETABLE (
+    Fct_Order,
+    Fct_Order[is_cancelled] = FALSE ()
+)
+
+// Delivery measures need an actual delivery date, not just a non-cancelled
+// order. ~3% of orders never arrived and must not be counted as "on time".
+Delivered Orders Base =
+CALCULATETABLE (
+    Fct_Order,
+    Fct_Order[is_cancelled] = FALSE (),
+    Fct_Order[is_delivered] = TRUE ()
+)
+
+
+// ------------------------------------------------------------------ sales KPIs
+
+// Item value = price + freight, summed at order grain. Deliberately NOT
+// payment_value: payments include installment interest and voucher top-ups,
+// which run ~1% above item value (see sql/04_reconciliation.sql).
+Total Revenue =
+CALCULATE (
+    SUM ( Fct_Order[order_value] ),
+    Fct_Order[is_cancelled] = FALSE ()
+)
+
+Product Revenue =
+CALCULATE (
+    SUM ( Fct_Order[product_revenue] ),
+    Fct_Order[is_cancelled] = FALSE ()
+)
+
+Freight Revenue =
+CALCULATE (
+    SUM ( Fct_Order[freight_value] ),
+    Fct_Order[is_cancelled] = FALSE ()
+)
+
+Total Orders =
+CALCULATE (
+    DISTINCTCOUNT ( Fct_Order[order_id] ),
+    Fct_Order[is_cancelled] = FALSE ()
+)
+
+// DISTINCTCOUNT on customer_unique_id, not customer_id: Olist issues a fresh
+// customer_id per order, so counting customer_id would just recount orders.
+Total Customers =
+CALCULATE (
+    DISTINCTCOUNT ( Fct_Order[customer_unique_id] ),
+    Fct_Order[is_cancelled] = FALSE ()
+)
+
+// AOV is revenue per ORDER, so the denominator is the order count, never the
+// item count and never the row count of a fanned-out table.
+Average Order Value =
+DIVIDE ( [Total Revenue], [Total Orders] )
+
+Items per Order =
+DIVIDE (
+    CALCULATE ( SUM ( Fct_Order[item_count] ), Fct_Order[is_cancelled] = FALSE () ),
+    [Total Orders]
+)
+
+Revenue MoM % =
+VAR CurrentRevenue = [Total Revenue]
+VAR PriorRevenue =
+    CALCULATE ( [Total Revenue], DATEADD ( Dim_Date[Date], -1, MONTH ) )
+RETURN
+    DIVIDE ( CurrentRevenue - PriorRevenue, PriorRevenue )
+
+Revenue YTD =
+CALCULATE ( [Total Revenue], DATESYTD ( Dim_Date[Date] ) )
+
+
+// --------------------------------------------------------------- delivery KPIs
+
+Delivered Orders =
+CALCULATE ( DISTINCTCOUNT ( Fct_Order[order_id] ), Fct_Order[is_cancelled] = FALSE (),
+            Fct_Order[is_delivered] = TRUE () )
+
+// Days from purchase to customer receipt. Averaged over delivered orders only:
+// including undelivered orders as 0 days would flatter the number, and
+// excluding them silently would hide the 3% that never arrived.
+Avg Delivery Days =
+CALCULATE (
+    AVERAGE ( Fct_Order[delivery_days] ),
+    Fct_Order[is_cancelled] = FALSE (),
+    Fct_Order[is_delivered] = TRUE ()
+)
+
+// Positive = arrived after the promised date. Negative = arrived early, which is
+// the normal case here because Olist pads its estimates heavily.
+Avg Delivery vs Promise =
+CALCULATE (
+    AVERAGE ( Fct_Order[delay_days] ),
+    Fct_Order[is_cancelled] = FALSE (),
+    Fct_Order[is_delivered] = TRUE ()
+)
+
+Late Orders =
+CALCULATE (
+    DISTINCTCOUNT ( Fct_Order[order_id] ),
+    Fct_Order[is_cancelled] = FALSE (),
+    Fct_Order[is_delivered] = TRUE (),
+    Fct_Order[is_late] = TRUE ()
+)
+
+// Denominator is delivered orders, NOT all orders. Quoting late rate over all
+// orders would dilute it with the ~3% that have no delivery date at all.
+Late Delivery Rate =
+DIVIDE ( [Late Orders], [Delivered Orders] )
+
+On Time Delivery Rate =
+1 - [Late Delivery Rate]
+
+// The gap between what Olist promised and what it delivered. A large positive
+// number means the estimate is padded, not that logistics is fast.
+Avg Promise Padding Days =
+CALCULATE (
+    AVERAGE ( Fct_Order[estimated_days] ) - AVERAGE ( Fct_Order[delivery_days] ),
+    Fct_Order[is_cancelled] = FALSE (),
+    Fct_Order[is_delivered] = TRUE ()
+)
+
+
+// ----------------------------------------------------------------- review KPIs
+
+// Blank-safe by construction: orders with no review are excluded by AVERAGE
+// rather than counted as zero, which would drag the mean below the 1-5 scale.
+Avg Review Score =
+CALCULATE (
+    AVERAGE ( Fct_Order[review_score] ),
+    Fct_Order[is_cancelled] = FALSE ()
+)
+
+Reviewed Orders =
+CALCULATE (
+    COUNTROWS ( Fct_Order ),
+    Fct_Order[is_cancelled] = FALSE (),
+    NOT ISBLANK ( Fct_Order[review_score] )
+)
+
+Review Coverage % =
+DIVIDE ( [Reviewed Orders], [Total Orders] )
+
+One Star Rate =
+DIVIDE (
+    CALCULATE ( COUNTROWS ( Fct_Order ), Fct_Order[is_cancelled] = FALSE (),
+                Fct_Order[review_score] = 1 ),
+    [Reviewed Orders]
+)
+
+Five Star Rate =
+DIVIDE (
+    CALCULATE ( COUNTROWS ( Fct_Order ), Fct_Order[is_cancelled] = FALSE (),
+                Fct_Order[review_score] = 5 ),
+    [Reviewed Orders]
+)
+
+// The headline number of the whole report: how many stars a late delivery costs.
+// Negative by definition; on this dataset it lands around -2.0.
+Review Gap Late vs On Time =
+VAR OnTime =
+    CALCULATE ( [Avg Review Score], Fct_Order[is_delivered] = TRUE (),
+                Fct_Order[is_late] = FALSE () )
+VAR Late =
+    CALCULATE ( [Avg Review Score], Fct_Order[is_delivered] = TRUE (),
+                Fct_Order[is_late] = TRUE () )
+RETURN
+    Late - OnTime
+
+// Revenue sitting behind orders that arrived late: the size of the problem in
+// currency rather than in stars.
+Revenue at Risk from Late Delivery =
+CALCULATE (
+    [Total Revenue],
+    Fct_Order[is_delivered] = TRUE (),
+    Fct_Order[is_late] = TRUE ()
+)
+
+
+// ------------------------------------------------- item-grain (category) KPIs
+// These live on Fct_OrderItem because a category belongs to a product, not to an
+// order. A four-item order spanning three categories contributes to all three,
+// and summing Category Revenue across categories returns [Total Revenue]
+// exactly - which is the check that proves the grain is right.
+
+Category Revenue =
+CALCULATE (
+    SUM ( Fct_OrderItem[item_value] ),
+    Fct_OrderItem[is_cancelled] = FALSE ()
+)
+
+Items Sold =
+CALCULATE (
+    COUNTROWS ( Fct_OrderItem ),
+    Fct_OrderItem[is_cancelled] = FALSE ()
+)
+
+Avg Item Price =
+CALCULATE (
+    AVERAGE ( Fct_OrderItem[price] ),
+    Fct_OrderItem[is_cancelled] = FALSE ()
+)
+
+// Freight as a share of what the customer pays. High values flag categories
+// where shipping economics, not product margin, drive the outcome.
+Freight Share of Item Value =
+DIVIDE (
+    CALCULATE ( SUM ( Fct_OrderItem[freight_value] ), Fct_OrderItem[is_cancelled] = FALSE () ),
+    [Category Revenue]
+)
+
+Category Late Rate =
+DIVIDE (
+    CALCULATE ( COUNTROWS ( Fct_OrderItem ), Fct_OrderItem[is_cancelled] = FALSE (),
+                Fct_OrderItem[is_late] = TRUE () ),
+    CALCULATE ( COUNTROWS ( Fct_OrderItem ), Fct_OrderItem[is_cancelled] = FALSE (),
+                Fct_OrderItem[is_delivered] = TRUE () )
+)
+
+Category Avg Review =
+CALCULATE (
+    AVERAGE ( Fct_OrderItem[review_score] ),
+    Fct_OrderItem[is_cancelled] = FALSE ()
+)
+
+
+// ---------------------------------------------------------------- guard rails
+// Put this card on a hidden diagnostics page. If it ever stops saying OK, a
+// relationship has gone many-to-many or a filter direction has been flipped and
+// the order totals are being fanned out.
+Grain Check =
+VAR OrderRows = CALCULATE ( COUNTROWS ( Fct_Order ), ALL ( Fct_Order ) )
+VAR DistinctOrders = CALCULATE ( DISTINCTCOUNT ( Fct_Order[order_id] ), ALL ( Fct_Order ) )
+RETURN
+    IF (
+        OrderRows = DistinctOrders,
+        "OK - " & FORMAT ( DistinctOrders, "#,##0" ) & " orders",
+        "BROKEN - " & FORMAT ( OrderRows, "#,##0" ) & " rows for "
+            & FORMAT ( DistinctOrders, "#,##0" ) & " orders"
+    )
+
+// Cross-grain tie-out: the two fact tables must agree on total value. Shown as a
+// currency difference so a rounding drift is distinguishable from a join bug.
+Fact Tables Tie Out =
+VAR OrderGrain = [Total Revenue]
+VAR ItemGrain = [Category Revenue]
+RETURN
+    IF (
+        ABS ( OrderGrain - ItemGrain ) < 0.01,
+        "OK",
+        "MISMATCH " & FORMAT ( OrderGrain - ItemGrain, "#,##0.00" )
+    )

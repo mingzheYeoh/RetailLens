@@ -1,0 +1,3 @@
+is_late,orders,avg_review,pct_1_star,pct_5_star
+False,89936,4.279,0.068,0.62
+True,6534,2.255,0.542,0.163
